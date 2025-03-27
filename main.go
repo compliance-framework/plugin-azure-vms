@@ -11,6 +11,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	policyManager "github.com/compliance-framework/agent/policy-manager"
 	"github.com/compliance-framework/agent/runner"
 	"github.com/compliance-framework/agent/runner/proto"
@@ -75,12 +76,151 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 				tags = append(tags, Tag{Key: key, Value: *value})
 			}
 
+			// Extract networking details
+			networkDetails := map[string]interface{}{
+				"publicIPAddress":  nil,
+				"privateIPAddress": nil,
+				"virtualNetwork":   nil,
+				"dnsName":          nil,
+				"securityGroup":    nil,
+			}
+			if vm.Properties.NetworkProfile != nil {
+				for _, nic := range vm.Properties.NetworkProfile.NetworkInterfaces {
+					nicClient, err := armnetwork.NewInterfacesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
+					if err != nil {
+						l.logger.Error("unable to create NIC client", "error", err)
+						evalStatus = proto.ExecutionStatus_FAILURE
+						accumulatedErrors = errors.Join(accumulatedErrors, err)
+						break
+					}
+
+					// Extract resource group and NIC name from NIC ID
+					nicIDParts, parseErr := internal.ParseAzureResourceID(*nic.ID)
+					if parseErr != nil {
+						l.logger.Error("unable to parse NIC ID", "nicID", *nic.ID, "error", parseErr)
+						evalStatus = proto.ExecutionStatus_FAILURE
+						accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
+						break
+					}
+
+					resourceGroup, ok := nicIDParts["resourceGroups"]
+					if !ok {
+						err := errors.New("resource group not found in NIC ID")
+						l.logger.Error("unable to extract resource group from NIC ID", "nicID", *nic.ID, "error", err)
+						evalStatus = proto.ExecutionStatus_FAILURE
+						accumulatedErrors = errors.Join(accumulatedErrors, err)
+						break
+					}
+
+					nicName, ok := nicIDParts["networkInterfaces"]
+					if !ok {
+						err := errors.New("NIC name not found in NIC ID")
+						l.logger.Error("unable to extract NIC name from NIC ID", "nicID", *nic.ID, "error", err)
+						evalStatus = proto.ExecutionStatus_FAILURE
+						accumulatedErrors = errors.Join(accumulatedErrors, err)
+						break
+					}
+
+					nicResp, err := nicClient.Get(ctx, resourceGroup, nicName, nil)
+					if err != nil {
+						l.logger.Error("unable to get NIC details", "resourceGroup", resourceGroup, "nicName", nicName, "error", err)
+						evalStatus = proto.ExecutionStatus_FAILURE
+						accumulatedErrors = errors.Join(accumulatedErrors, err)
+						break
+					}
+
+					if nicResp.Properties != nil {
+						if nicResp.Properties.IPConfigurations != nil {
+							for _, ipConfig := range nicResp.Properties.IPConfigurations {
+								if ipConfig.Properties != nil {
+									if ipConfig.Properties.PrivateIPAddress != nil {
+										networkDetails["privateIPAddress"] = *ipConfig.Properties.PrivateIPAddress
+									}
+									if ipConfig.Properties.PublicIPAddress != nil {
+										publicIPClient, err := armnetwork.NewPublicIPAddressesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
+										if err != nil {
+											l.logger.Error("unable to create Public IP client", "error", err)
+											evalStatus = proto.ExecutionStatus_FAILURE
+											accumulatedErrors = errors.Join(accumulatedErrors, err)
+											break
+										}
+
+										// Extract resource group and public IP name from Public IP ID
+										publicIPIDParts, parseErr := internal.ParseAzureResourceID(*ipConfig.Properties.PublicIPAddress.ID)
+										if parseErr != nil {
+											l.logger.Error("unable to parse Public IP ID", "publicIPID", *ipConfig.Properties.PublicIPAddress.ID, "error", parseErr)
+											evalStatus = proto.ExecutionStatus_FAILURE
+											accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
+											break
+										}
+										publicIPResourceGroup := publicIPIDParts["resourceGroups"]
+										publicIPName := publicIPIDParts["publicIPAddresses"]
+
+										publicIPResp, err := publicIPClient.Get(ctx, publicIPResourceGroup, publicIPName, nil)
+										if err != nil {
+											l.logger.Error("unable to get Public IP details", "error", err)
+											evalStatus = proto.ExecutionStatus_FAILURE
+											accumulatedErrors = errors.Join(accumulatedErrors, err)
+											break
+										}
+
+										if publicIPResp.Properties != nil && publicIPResp.Properties.IPAddress != nil {
+											networkDetails["publicIPAddress"] = *publicIPResp.Properties.IPAddress
+										}
+									}
+								}
+							}
+						}
+						if nicResp.Properties.DNSSettings != nil && nicResp.Properties.DNSSettings.InternalDomainNameSuffix != nil {
+							networkDetails["dnsName"] = *nicResp.Properties.DNSSettings.InternalDomainNameSuffix
+						}
+						if nicResp.Properties.NetworkSecurityGroup != nil {
+							securityGroupClient, err := armnetwork.NewSecurityGroupsClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
+							if err != nil {
+								l.logger.Error("unable to create Security Group client", "error", err)
+								evalStatus = proto.ExecutionStatus_FAILURE
+								accumulatedErrors = errors.Join(accumulatedErrors, err)
+								break
+							}
+
+							// Extract resource group and security group name from Security Group ID
+							securityGroupIDParts, parseErr := internal.ParseAzureResourceID(*nicResp.Properties.NetworkSecurityGroup.ID)
+							if parseErr != nil {
+								l.logger.Error("unable to parse Security Group ID", "securityGroupID", *nicResp.Properties.NetworkSecurityGroup.ID, "error", parseErr)
+								evalStatus = proto.ExecutionStatus_FAILURE
+								accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
+								break
+							}
+							securityGroupResourceGroup := securityGroupIDParts["resourceGroups"]
+							securityGroupName := securityGroupIDParts["networkSecurityGroups"]
+
+							securityGroupResp, err := securityGroupClient.Get(ctx, securityGroupResourceGroup, securityGroupName, nil)
+							if err != nil {
+								l.logger.Error("unable to get Security Group details", "error", err)
+								evalStatus = proto.ExecutionStatus_FAILURE
+								accumulatedErrors = errors.Join(accumulatedErrors, err)
+								break
+							}
+
+							if securityGroupResp.Properties != nil {
+								networkDetails["securityGroup"] = map[string]interface{}{
+									"id":           *nicResp.Properties.NetworkSecurityGroup.ID,
+									"rules":        securityGroupResp.Properties.SecurityRules,
+									"defaultRules": securityGroupResp.Properties.DefaultSecurityRules,
+								}
+							}
+						}
+					}
+				}
+			}
+
 			properties := map[string]interface{}{
 				"hardwareProfile":   vm.Properties.HardwareProfile,
 				"storageProfile":    vm.Properties.StorageProfile,
 				"osProfile":         vm.Properties.OSProfile,
 				"networkProfile":    vm.Properties.NetworkProfile,
 				"provisioningState": vm.Properties.ProvisioningState,
+				"networkDetails":    networkDetails,
 			}
 
 			subjectAttributeMap := map[string]string{
