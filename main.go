@@ -214,13 +214,52 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 				}
 			}
 
+			// Retrieve disk encryption settings
+			diskEncryptionSettings := map[string]interface{}{
+				"osDisk":    nil,
+				"dataDisks": nil,
+			}
+			if vm.Properties.StorageProfile != nil {
+				if vm.Properties.StorageProfile.OSDisk != nil && vm.Properties.StorageProfile.OSDisk.EncryptionSettings != nil {
+					diskEncryptionSettings["osDisk"] = vm.Properties.StorageProfile.OSDisk.EncryptionSettings
+				}
+			}
+
+			// Retrieve disk details
+			diskDetails := map[string]interface{}{
+				"osDiskName":          nil,
+				"encryptionAtHost":    nil,
+				"azureDiskEncryption": nil,
+				"ephemeralOSDisk":     nil,
+				"dataDisksCount":      0,
+			}
+			if vm.Properties.StorageProfile != nil {
+				// OS Disk details
+				if vm.Properties.StorageProfile.OSDisk != nil {
+					diskDetails["osDiskName"] = vm.Properties.StorageProfile.OSDisk.Name
+					diskDetails["encryptionAtHost"] = vm.Properties.StorageProfile.OSDisk.EncryptionSettings != nil
+					diskDetails["azureDiskEncryption"] = vm.Properties.StorageProfile.OSDisk.ManagedDisk != nil &&
+						vm.Properties.StorageProfile.OSDisk.ManagedDisk.DiskEncryptionSet != nil
+					if vm.Properties.StorageProfile.OSDisk.Caching != nil {
+						diskDetails["ephemeralOSDisk"] = *vm.Properties.StorageProfile.OSDisk.Caching == armcompute.CachingTypesReadWrite
+					}
+				}
+
+				// Data Disks details
+				if vm.Properties.StorageProfile.DataDisks != nil {
+					diskDetails["dataDisksCount"] = len(vm.Properties.StorageProfile.DataDisks)
+				}
+			}
+
 			properties := map[string]interface{}{
-				"hardwareProfile":   vm.Properties.HardwareProfile,
-				"storageProfile":    vm.Properties.StorageProfile,
-				"osProfile":         vm.Properties.OSProfile,
-				"networkProfile":    vm.Properties.NetworkProfile,
-				"provisioningState": vm.Properties.ProvisioningState,
-				"networkDetails":    networkDetails,
+				"hardwareProfile":        vm.Properties.HardwareProfile,
+				"storageProfile":         vm.Properties.StorageProfile,
+				"osProfile":              vm.Properties.OSProfile,
+				"networkProfile":         vm.Properties.NetworkProfile,
+				"provisioningState":      vm.Properties.ProvisioningState,
+				"networkDetails":         networkDetails,
+				"diskEncryptionSettings": diskEncryptionSettings,
+				"diskDetails":            diskDetails,
 			}
 
 			subjectAttributeMap := map[string]string{
