@@ -403,6 +403,16 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 					}
 
 					newFinding := func() *proto.Finding {
+						controls := make([]*proto.ControlReference, 0)
+
+						for _, control := range result.Controls {
+							controls = append(controls, &proto.ControlReference{
+								Class:        control.Class,
+								ControlId:    control.ControlID,
+								StatementIds: control.StatementIDs,
+							})
+						}
+
 						return &proto.Finding{
 							ID:        uuid.New().String(),
 							UUID:      findingUUID.String(),
@@ -419,7 +429,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 							Subjects:            subjects,
 							Components:          components,
 							RelatedObservations: []*proto.RelatedObservation{{ObservationUUID: observation.ID}},
-							Controls:            nil,
+							Controls:            controls,
 						}
 					}
 

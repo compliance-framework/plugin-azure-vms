@@ -72,10 +72,14 @@ github.com/compliance-framework/agent v0.0.15 h1:VEB3xI3VSgTeudw8L+Czv9VCMt6vM7N
 github.com/compliance-framework/agent v0.0.15/go.mod h1:/ZxHkJJm/wthxm+W7atUgSMfL2217cCaBgN6dfsDSYo=
 github.com/compliance-framework/agent v0.1.1 h1:uQ4idgwOMqrgM0JeYCtBv20HZoMymsH2nownrkl457w=
 github.com/compliance-framework/agent v0.1.1/go.mod h1:jy/26xgTx9+at64ipTV1oo80pTVyhtlZaSMViQ3cVVQ=
+github.com/compliance-framework/agent v0.1.5 h1:kKRpY1Rado4AX0m1C3+wMpDjrbxn98AdmcrmXQUBkbo=
+github.com/compliance-framework/agent v0.1.5/go.mod h1:4/NXMHo9zB8JHSDz9pXsCAaO6mzspjfL2hrWZSW2rjA=
 github.com/compliance-framework/configuration-service v0.0.5 h1:vK9mSb8dzaaTt+hd+g2g3+8nvfr/Ha5pMXB4yiYMA64=
 github.com/compliance-framework/configuration-service v0.0.5/go.mod h1:irXS+U+ZGaNrOmaNqb+pMmo+4BxSZJ0/vs4ne/5qVJc=
 github.com/compliance-framework/configuration-service v0.1.1 h1:p/r5vq1FLe0S8j/kLhth4Dvda8xajVPOBjnO9QauMjM=
 github.com/compliance-framework/configuration-service v0.1.1/go.mod h1:tLKJKXbQbY9Pg/e3BJtJVkqxaejXJMHoE8Yp0NW4lDE=
+github.com/compliance-framework/configuration-service v0.1.3 h1:Gf9/v+4IAHG2iVh+gZSiboMH7tAsVBn4FtnJZZsQIrU=
+github.com/compliance-framework/configuration-service v0.1.3/go.mod h1:tLKJKXbQbY9Pg/e3BJtJVkqxaejXJMHoE8Yp0NW4lDE=
 github.com/containerd/containerd v1.7.24 h1:zxszGrGjrra1yYJW/6rhm9cJ1ZQ8rkKBR48brqsa7nA=
 github.com/containerd/containerd v1.7.24/go.mod h1:7QUzfURqZWCZV7RLNEn1XjUCQLEf0bkaK4GjUaZehxw=
 github.com/containerd/log v0.1.0 h1:TCJt7ioM2cr/tfR8GPbGf9/VRAX8D2B4PjzCpfX540I=
