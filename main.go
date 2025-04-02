@@ -311,7 +311,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 			}
 			components := []*proto.ComponentReference{
 				{
-					Identifier: "common-components/aws-security-group",
+					Identifier: "common-components/azure-virtual-machine",
 				},
 			}
 
@@ -409,7 +409,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 							Collected: timestamppb.New(time.Now()),
 							Labels: map[string]string{
 								"type":          "azure",
-								"service":       "security-groups",
+								"service":       "virtual-machine",
 								"instance-id":   *vm.ID,
 								"instance-name": *vm.Name,
 								"_policy":       result.Policy.Package.PurePackage(),
@@ -495,7 +495,7 @@ func main() {
 		logger: logger,
 	}
 	// pluginMap is the map of plugins we can dispense.
-	logger.Debug("Initiating Azure network security plugin")
+	logger.Debug("Initiating Azure Virtual Machine plugin")
 
 	goplugin.Serve(&goplugin.ServeConfig{
 		HandshakeConfig: runner.HandshakeConfig,
