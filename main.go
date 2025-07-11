@@ -174,7 +174,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 		inventory := []*proto.InventoryItem{
 			{
 				Identifier: "azure-vm/" + vm.ID(),
-				Type:       "virtual-machine",
+				Type:       "web-server",
 				Title:      fmt.Sprintf("Azure VM [%s]", vm.ID()),
 				Props: []*proto.Property{
 					{
