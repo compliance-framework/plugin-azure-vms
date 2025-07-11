@@ -9,6 +9,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 
 	policyManager "github.com/compliance-framework/agent/policy-manager"
 	"github.com/compliance-framework/agent/runner"
@@ -19,12 +20,14 @@ import (
 )
 
 type CompliancePlugin struct {
-	logger hclog.Logger
-	config map[string]string
+	logger           hclog.Logger
+	config           map[string]string
+	azureCredentials *azidentity.DefaultAzureCredential
 }
 
 type AzureVMInstance struct {
-	Instance *armcompute.VirtualMachine `json:"instance"`
+	Instance          *armcompute.VirtualMachine `json:"instance"`
+	NetworkInterfaces []*AzureVMNetworkInterface `json:"network_interfaces"`
 }
 
 func (i *AzureVMInstance) ID() string {
@@ -39,6 +42,12 @@ func (i *AzureVMInstance) Name() string {
 		return ""
 	}
 	return *i.Instance.Name
+}
+
+type AzureVMNetworkInterface struct {
+	Config        *armnetwork.InterfacesClientGetResponse          `json:"config"`
+	PublicIPs     []*armnetwork.PublicIPAddressesClientGetResponse `json:"public_ips,omitempty"`
+	SecurityGroup *armnetwork.SecurityGroupsClientGetResponse      `json:"security_group,omitempty"`
 }
 
 type Tag struct {
@@ -70,19 +79,32 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 				Title:       "List Azure VMs",
 				Description: "List all Azure VMs in the specified subscription.",
 			},
+			{
+				Title:       "Get Attached Network Interfaces",
+				Description: "For each VM, retrieve the attached network interfaces and their details.",
+			},
+			{
+				Title:       "Get Public IP Addresses",
+				Description: "For each network interface, retrieve the associated public IP addresses.",
+			},
+			{
+				Title:       "Get Attached Security Groups",
+				Description: "For each network interface, retrieve the associated security groups and their rules.",
+			},
 		},
 	})
 
 	// create credential service for azure
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	creds, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		l.logger.Error("unable to get Azure credentials", "error", err)
 		return &proto.EvalResponse{
 			Status: proto.ExecutionStatus_FAILURE,
 		}, err
 	}
+	l.azureCredentials = creds
 
-	vmClient, err := armcompute.NewVirtualMachinesClient(l.config["subscription_id"], cred, nil)
+	vmClient, err := armcompute.NewVirtualMachinesClient(l.config["subscription_id"], l.azureCredentials, nil)
 	if err != nil {
 		l.logger.Error("unable to create Azure VM client", "error", err)
 		return &proto.EvalResponse{
@@ -228,6 +250,16 @@ func (l *CompliancePlugin) GetVMs(ctx context.Context, client *armcompute.Virtua
 				azureInstance := &AzureVMInstance{
 					Instance: vm,
 				}
+				if vm.Properties.NetworkProfile != nil {
+					config, err := l.GetNetworkConfig(ctx, vm.Properties.NetworkProfile)
+					if err != nil {
+						l.logger.Error("unable to get network interfaces", "error", err)
+						yield(nil, err)
+						return
+					}
+					azureInstance.NetworkInterfaces = config
+				}
+
 				if !yield(azureInstance, nil) {
 					return
 				}
@@ -235,6 +267,89 @@ func (l *CompliancePlugin) GetVMs(ctx context.Context, client *armcompute.Virtua
 		}
 	}
 
+}
+
+func (l *CompliancePlugin) GetNetworkConfig(ctx context.Context, networkProfile *armcompute.NetworkProfile) ([]*AzureVMNetworkInterface, error) {
+	l.logger.Debug("Getting network configuration for Azure VM")
+	nicClient, err := armnetwork.NewInterfacesClient(l.config["subscription_id"], l.azureCredentials, nil)
+	networkInterfaces := make([]*AzureVMNetworkInterface, len(networkProfile.NetworkInterfaces))
+
+	if err != nil {
+		l.logger.Error("unable to create Azure NIC client", "error", err)
+		return nil, err
+	}
+
+	for i, nicRef := range networkProfile.NetworkInterfaces {
+		nicInterface := &AzureVMNetworkInterface{
+			PublicIPs: make([]*armnetwork.PublicIPAddressesClientGetResponse, 0),
+		}
+
+		nicParts, err := internal.ParseAzureResourceID(*nicRef.ID)
+		if err != nil {
+			l.logger.Error("unable to parse NIC ID", "error", err, "nic_id", *nicRef.ID)
+			return nil, err
+		}
+
+		resp, err := nicClient.Get(ctx, nicParts["resourceGroups"], nicParts["networkInterfaces"], nil)
+		if err != nil {
+			l.logger.Error("unable to get NIC details", "error", err, "nic_id", *nicRef.ID)
+			return nil, err
+		}
+
+		nicInterface.Config = &resp
+
+		if resp.Properties.IPConfigurations != nil {
+			for _, ipConfig := range resp.Properties.IPConfigurations {
+				if ipConfig.Properties.PublicIPAddress != nil && ipConfig.Properties.PublicIPAddress.ID != nil {
+					l.logger.Debug("Found Public IP configuration", "nic_id", *nicRef.ID, "ip_config_id", *ipConfig.ID, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+					ipParts, err := internal.ParseAzureResourceID(*ipConfig.Properties.PublicIPAddress.ID)
+					if err != nil {
+						l.logger.Error("unable to parse Public IP ID", "error", err, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+						return nil, err
+					}
+
+					publicIPClient, err := armnetwork.NewPublicIPAddressesClient(l.config["subscription_id"], l.azureCredentials, nil)
+					if err != nil {
+						l.logger.Error("unable to create Azure Public IP client", "error", err)
+						return nil, err
+					}
+
+					publicIPResp, err := publicIPClient.Get(ctx, ipParts["resourceGroups"], ipParts["publicIPAddresses"], nil)
+					if err != nil {
+						l.logger.Error("unable to get Public IP details", "error", err, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+						return nil, err
+					}
+					l.logger.Debug("Found Public IP", "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID, "ip_address", *publicIPResp.Properties.IPAddress)
+					nicInterface.PublicIPs = append(nicInterface.PublicIPs, &publicIPResp)
+				}
+			}
+		}
+
+		if resp.Properties.NetworkSecurityGroup != nil && resp.Properties.NetworkSecurityGroup.ID != nil {
+			sgParts, err := internal.ParseAzureResourceID(*resp.Properties.NetworkSecurityGroup.ID)
+			if err != nil {
+				l.logger.Error("unable to parse Network Security Group ID", "error", err, "nsg_id", *resp.Properties.NetworkSecurityGroup.ID)
+				return nil, err
+			}
+
+			securityGroupClient, err := armnetwork.NewSecurityGroupsClient(l.config["subscription_id"], l.azureCredentials, nil)
+			if err != nil {
+				l.logger.Error("unable to create Azure Security Group client", "error", err)
+				return nil, err
+			}
+
+			securityGroupResp, err := securityGroupClient.Get(ctx, sgParts["resourceGroups"], sgParts["networkSecurityGroups"], nil)
+			if err != nil {
+				l.logger.Error("unable to get Network Security Group details", "error", err, "nsg_id", *resp.Properties.NetworkSecurityGroup.ID)
+				return nil, err
+			}
+			nicInterface.SecurityGroup = &securityGroupResp
+
+		}
+
+		networkInterfaces[i] = nicInterface
+	}
+	return networkInterfaces, nil
 }
 
 func main() {
