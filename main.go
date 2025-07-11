@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"slices"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
@@ -120,10 +119,21 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 			break
 		}
 
+		idParts, err := internal.ParseAzureResourceID(vm.ID())
+		if err != nil {
+			l.logger.Error("unable to parse VM ID", "error", err, "vm_id", vm.ID())
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			evalStatus = proto.ExecutionStatus_FAILURE
+			break
+		}
+
 		labels := map[string]string{
-			"provider":    "azure",
-			"type":        "virtual-machine",
-			"instance-id": vm.ID(),
+			"provider":        "azure",
+			"type":            "virtual-machine",
+			"instance-id":     vm.ID(),
+			"resource-group":  idParts["resourceGroups"],
+			"location":        *vm.Instance.Location,
+			"subscription-id": idParts["subscriptions"],
 		}
 
 		actors := []*proto.OriginActor{
@@ -145,7 +155,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 					{
 						Href: "https://github.com/compliance-framework/plugin-azure-vms",
 						Rel:  internal.StringAddressed("reference"),
-						Text: internal.StringAddressed("The Continuous Compliance Framework' Azure VM Plugin"),
+						Text: internal.StringAddressed("The Continuous Compliance Framework's Azure VM Plugin"),
 					},
 				},
 			},
@@ -209,7 +219,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 			)
 
 			evidence, err := processor.GenerateResults(ctx, policyPath, vm)
-			evidences = slices.Concat(evidences, evidence)
+			evidences = append(evidences, evidence...)
 
 			if err != nil {
 				l.logger.Error("Error processing policy", "error", err, "policyPath", policyPath, "vm_id", vm.ID())
