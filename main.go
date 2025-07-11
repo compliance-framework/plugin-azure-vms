@@ -161,7 +161,7 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 			},
 		}
 
-		compoents := []*proto.Component{
+		components := []*proto.Component{
 			{
 				Identifier:  "common-components/azure-virtual-machine",
 				Type:        "service",
@@ -205,14 +205,9 @@ func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.Api
 
 			processor := policyManager.NewPolicyProcessor(
 				l.logger,
-				internal.MergeMaps(
-					labels,
-					map[string]string{
-						"_policy_path": policyPath,
-					},
-				),
+				labels,
 				subjects,
-				compoents,
+				components,
 				inventory,
 				actors,
 				activities,
