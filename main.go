@@ -4,27 +4,49 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"time"
-
-	"github.com/compliance-framework/plugin-azure-vms/internal"
+	"iter"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
+
 	policyManager "github.com/compliance-framework/agent/policy-manager"
 	"github.com/compliance-framework/agent/runner"
 	"github.com/compliance-framework/agent/runner/proto"
-	"github.com/compliance-framework/configuration-service/sdk"
-	"github.com/google/uuid"
+	"github.com/compliance-framework/plugin-azure-vms/internal"
 	"github.com/hashicorp/go-hclog"
 	goplugin "github.com/hashicorp/go-plugin"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type CompliancePlugin struct {
-	logger hclog.Logger
-	config map[string]string
+	logger           hclog.Logger
+	config           map[string]string
+	azureCredentials *azidentity.DefaultAzureCredential
+}
+
+type AzureVMInstance struct {
+	Instance          *armcompute.VirtualMachine `json:"instance"`
+	NetworkInterfaces []*AzureVMNetworkInterface `json:"network_interfaces"`
+}
+
+func (i *AzureVMInstance) ID() string {
+	if i.Instance == nil || i.Instance.ID == nil {
+		return ""
+	}
+	return *i.Instance.ID
+}
+
+func (i *AzureVMInstance) Name() string {
+	if i.Instance == nil || i.Instance.Name == nil {
+		return ""
+	}
+	return *i.Instance.Name
+}
+
+type AzureVMNetworkInterface struct {
+	Config        *armnetwork.InterfacesClientGetResponse          `json:"config"`
+	PublicIPs     []*armnetwork.PublicIPAddressesClientGetResponse `json:"public_ips,omitempty"`
+	SecurityGroup *armnetwork.SecurityGroupsClientGetResponse      `json:"security_group,omitempty"`
 }
 
 type Tag struct {
@@ -38,451 +60,301 @@ func (l *CompliancePlugin) Configure(req *proto.ConfigureRequest) (*proto.Config
 }
 
 func (l *CompliancePlugin) Eval(request *proto.EvalRequest, apiHelper runner.ApiHelper) (*proto.EvalResponse, error) {
+	l.logger.Debug("Eval called with request", "request", request)
 	ctx := context.TODO()
-	startTime := time.Now()
 	evalStatus := proto.ExecutionStatus_SUCCESS
 	var accumulatedErrors error
 
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	activities := make([]*proto.Activity, 0)
+	activities = append(activities, &proto.Activity{
+		Title:       "Collect Azure VM configurations",
+		Description: "Collect Azure VM configurations using the Azure SDK for Go.",
+		Steps: []*proto.Step{
+			{
+				Title:       "Initialize Azure SDK",
+				Description: "Initialize the Azure SDK with the provided credentials and subscription ID.",
+			},
+			{
+				Title:       "List Azure VMs",
+				Description: "List all Azure VMs in the specified subscription.",
+			},
+			{
+				Title:       "Get Attached Network Interfaces",
+				Description: "For each VM, retrieve the attached network interfaces and their details.",
+			},
+			{
+				Title:       "Get Public IP Addresses",
+				Description: "For each network interface, retrieve the associated public IP addresses.",
+			},
+			{
+				Title:       "Get Attached Security Groups",
+				Description: "For each network interface, retrieve the associated security groups and their rules.",
+			},
+		},
+	})
+
+	// create credential service for azure
+	creds, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		l.logger.Error("unable to get Azure credentials", "error", err)
-		evalStatus = proto.ExecutionStatus_FAILURE
-		accumulatedErrors = errors.Join(accumulatedErrors, err)
+		return &proto.EvalResponse{
+			Status: proto.ExecutionStatus_FAILURE,
+		}, err
 	}
+	l.azureCredentials = creds
 
-	client, err := armcompute.NewVirtualMachinesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
+	vmClient, err := armcompute.NewVirtualMachinesClient(l.config["subscription_id"], l.azureCredentials, nil)
 	if err != nil {
 		l.logger.Error("unable to create Azure VM client", "error", err)
-		evalStatus = proto.ExecutionStatus_FAILURE
-		accumulatedErrors = errors.Join(accumulatedErrors, err)
+		return &proto.EvalResponse{
+			Status: proto.ExecutionStatus_FAILURE,
+		}, err
 	}
 
-	// Get VM instances
-	pager := client.NewListAllPager(nil)
-	var vmInstances []map[string]interface{}
-	for pager.More() {
-		page, err := pager.NextPage(ctx)
+	for vm, err := range l.GetVMs(ctx, vmClient) {
 		if err != nil {
-			l.logger.Error("unable to list VM instances", "error", err)
-			evalStatus = proto.ExecutionStatus_FAILURE
+			l.logger.Error("Error getting VM", "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			evalStatus = proto.ExecutionStatus_FAILURE
 			break
 		}
 
-		// Parse VM instances
-		for _, vm := range page.Value {
-			var tags []Tag
-			for key, value := range vm.Tags {
-				tags = append(tags, Tag{Key: key, Value: *value})
-			}
+		idParts, err := internal.ParseAzureResourceID(vm.ID())
+		if err != nil {
+			l.logger.Error("unable to parse VM ID", "error", err, "vm_id", vm.ID())
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			evalStatus = proto.ExecutionStatus_FAILURE
+			break
+		}
 
-			// Extract networking details
-			networkDetails := map[string]interface{}{
-				"publicIPAddress":  nil,
-				"privateIPAddress": nil,
-				"virtualNetwork":   nil,
-				"dnsName":          nil,
-				"securityGroup":    nil,
-			}
-			if vm.Properties.NetworkProfile != nil {
-				for _, nic := range vm.Properties.NetworkProfile.NetworkInterfaces {
-					nicClient, err := armnetwork.NewInterfacesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
-					if err != nil {
-						l.logger.Error("unable to create NIC client", "error", err)
-						evalStatus = proto.ExecutionStatus_FAILURE
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						break
-					}
+		labels := map[string]string{
+			"provider":        "azure",
+			"type":            "virtual-machine",
+			"instance-id":     vm.ID(),
+			"resource-group":  idParts["resourceGroups"],
+			"location":        *vm.Instance.Location,
+			"subscription-id": idParts["subscriptions"],
+		}
 
-					// Extract resource group and NIC name from NIC ID
-					nicIDParts, parseErr := internal.ParseAzureResourceID(*nic.ID)
-					if parseErr != nil {
-						l.logger.Error("unable to parse NIC ID", "nicID", *nic.ID, "error", parseErr)
-						evalStatus = proto.ExecutionStatus_FAILURE
-						accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
-						break
-					}
-
-					resourceGroup, ok := nicIDParts["resourceGroups"]
-					if !ok {
-						err := errors.New("resource group not found in NIC ID")
-						l.logger.Error("unable to extract resource group from NIC ID", "nicID", *nic.ID, "error", err)
-						evalStatus = proto.ExecutionStatus_FAILURE
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						break
-					}
-
-					nicName, ok := nicIDParts["networkInterfaces"]
-					if !ok {
-						err := errors.New("NIC name not found in NIC ID")
-						l.logger.Error("unable to extract NIC name from NIC ID", "nicID", *nic.ID, "error", err)
-						evalStatus = proto.ExecutionStatus_FAILURE
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						break
-					}
-
-					nicResp, err := nicClient.Get(ctx, resourceGroup, nicName, nil)
-					if err != nil {
-						l.logger.Error("unable to get NIC details", "resourceGroup", resourceGroup, "nicName", nicName, "error", err)
-						evalStatus = proto.ExecutionStatus_FAILURE
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						break
-					}
-
-					if nicResp.Properties != nil {
-						if nicResp.Properties.IPConfigurations != nil {
-							for _, ipConfig := range nicResp.Properties.IPConfigurations {
-								if ipConfig.Properties != nil {
-									if ipConfig.Properties.PrivateIPAddress != nil {
-										networkDetails["privateIPAddress"] = *ipConfig.Properties.PrivateIPAddress
-									}
-									if ipConfig.Properties.PublicIPAddress != nil {
-										publicIPClient, err := armnetwork.NewPublicIPAddressesClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
-										if err != nil {
-											l.logger.Error("unable to create Public IP client", "error", err)
-											evalStatus = proto.ExecutionStatus_FAILURE
-											accumulatedErrors = errors.Join(accumulatedErrors, err)
-											break
-										}
-
-										// Extract resource group and public IP name from Public IP ID
-										publicIPIDParts, parseErr := internal.ParseAzureResourceID(*ipConfig.Properties.PublicIPAddress.ID)
-										if parseErr != nil {
-											l.logger.Error("unable to parse Public IP ID", "publicIPID", *ipConfig.Properties.PublicIPAddress.ID, "error", parseErr)
-											evalStatus = proto.ExecutionStatus_FAILURE
-											accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
-											break
-										}
-										publicIPResourceGroup := publicIPIDParts["resourceGroups"]
-										publicIPName := publicIPIDParts["publicIPAddresses"]
-
-										publicIPResp, err := publicIPClient.Get(ctx, publicIPResourceGroup, publicIPName, nil)
-										if err != nil {
-											l.logger.Error("unable to get Public IP details", "error", err)
-											evalStatus = proto.ExecutionStatus_FAILURE
-											accumulatedErrors = errors.Join(accumulatedErrors, err)
-											break
-										}
-
-										if publicIPResp.Properties != nil && publicIPResp.Properties.IPAddress != nil {
-											networkDetails["publicIPAddress"] = *publicIPResp.Properties.IPAddress
-										}
-									}
-								}
-							}
-						}
-						if nicResp.Properties.DNSSettings != nil && nicResp.Properties.DNSSettings.InternalDomainNameSuffix != nil {
-							networkDetails["dnsName"] = *nicResp.Properties.DNSSettings.InternalDomainNameSuffix
-						}
-						if nicResp.Properties.NetworkSecurityGroup != nil {
-							securityGroupClient, err := armnetwork.NewSecurityGroupsClient(os.Getenv("AZURE_SUBSCRIPTION_ID"), cred, nil)
-							if err != nil {
-								l.logger.Error("unable to create Security Group client", "error", err)
-								evalStatus = proto.ExecutionStatus_FAILURE
-								accumulatedErrors = errors.Join(accumulatedErrors, err)
-								break
-							}
-
-							// Extract resource group and security group name from Security Group ID
-							securityGroupIDParts, parseErr := internal.ParseAzureResourceID(*nicResp.Properties.NetworkSecurityGroup.ID)
-							if parseErr != nil {
-								l.logger.Error("unable to parse Security Group ID", "securityGroupID", *nicResp.Properties.NetworkSecurityGroup.ID, "error", parseErr)
-								evalStatus = proto.ExecutionStatus_FAILURE
-								accumulatedErrors = errors.Join(accumulatedErrors, parseErr)
-								break
-							}
-							securityGroupResourceGroup := securityGroupIDParts["resourceGroups"]
-							securityGroupName := securityGroupIDParts["networkSecurityGroups"]
-
-							securityGroupResp, err := securityGroupClient.Get(ctx, securityGroupResourceGroup, securityGroupName, nil)
-							if err != nil {
-								l.logger.Error("unable to get Security Group details", "error", err)
-								evalStatus = proto.ExecutionStatus_FAILURE
-								accumulatedErrors = errors.Join(accumulatedErrors, err)
-								break
-							}
-
-							if securityGroupResp.Properties != nil {
-								networkDetails["securityGroup"] = map[string]interface{}{
-									"id":           *nicResp.Properties.NetworkSecurityGroup.ID,
-									"rules":        securityGroupResp.Properties.SecurityRules,
-									"defaultRules": securityGroupResp.Properties.DefaultSecurityRules,
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Retrieve disk encryption settings
-			diskEncryptionSettings := map[string]interface{}{
-				"osDisk":    nil,
-				"dataDisks": nil,
-			}
-			if vm.Properties.StorageProfile != nil {
-				if vm.Properties.StorageProfile.OSDisk != nil && vm.Properties.StorageProfile.OSDisk.EncryptionSettings != nil {
-					diskEncryptionSettings["osDisk"] = vm.Properties.StorageProfile.OSDisk.EncryptionSettings
-				}
-			}
-
-			// Retrieve disk details
-			diskDetails := map[string]interface{}{
-				"osDiskName":          nil,
-				"encryptionAtHost":    nil,
-				"azureDiskEncryption": nil,
-				"ephemeralOSDisk":     nil,
-				"dataDisksCount":      0,
-			}
-			if vm.Properties.StorageProfile != nil {
-				// OS Disk details
-				if vm.Properties.StorageProfile.OSDisk != nil {
-					diskDetails["osDiskName"] = vm.Properties.StorageProfile.OSDisk.Name
-					diskDetails["encryptionAtHost"] = vm.Properties.StorageProfile.OSDisk.EncryptionSettings != nil
-					diskDetails["azureDiskEncryption"] = vm.Properties.StorageProfile.OSDisk.ManagedDisk != nil &&
-						vm.Properties.StorageProfile.OSDisk.ManagedDisk.DiskEncryptionSet != nil
-					if vm.Properties.StorageProfile.OSDisk.Caching != nil {
-						diskDetails["ephemeralOSDisk"] = *vm.Properties.StorageProfile.OSDisk.Caching == armcompute.CachingTypesReadWrite
-					}
-				}
-
-				// Data Disks details
-				if vm.Properties.StorageProfile.DataDisks != nil {
-					diskDetails["dataDisksCount"] = len(vm.Properties.StorageProfile.DataDisks)
-				}
-			}
-
-			properties := map[string]interface{}{
-				"hardwareProfile":        vm.Properties.HardwareProfile,
-				"storageProfile":         vm.Properties.StorageProfile,
-				"osProfile":              vm.Properties.OSProfile,
-				"networkProfile":         vm.Properties.NetworkProfile,
-				"provisioningState":      vm.Properties.ProvisioningState,
-				"networkDetails":         networkDetails,
-				"diskEncryptionSettings": diskEncryptionSettings,
-				"diskDetails":            diskDetails,
-			}
-
-			subjectAttributeMap := map[string]string{
-				"type":          "azure",
-				"service":       "virtual-machine",
-				"instance-id":   *vm.ID,
-				"instance-name": *vm.Name,
-			}
-			subjects := []*proto.SubjectReference{
-				{
-					Type:       "azure-virtual-machine",
-					Attributes: subjectAttributeMap,
-					Title:      internal.StringAddressed("Azure Virtual Machine"),
-					Props: []*proto.Property{
-						{
-							Name:  "vm-id",
-							Value: *vm.ID,
-						},
-						{
-							Name:  "vm-name",
-							Value: *vm.Name,
-						},
+		actors := []*proto.OriginActor{
+			{
+				Title: "The Continuous Compliance Framework",
+				Type:  "assessment-platform",
+				Links: []*proto.Link{
+					{
+						Href: "https://compliance-framework.github.io/docs/",
+						Rel:  internal.StringAddressed("reference"),
+						Text: internal.StringAddressed("The Continuous Compliance Framework"),
 					},
 				},
-			}
-			actors := []*proto.OriginActor{
-				{
-					Title: "The Continuous Compliance Framework",
-					Type:  "assessment-platform",
-					Links: []*proto.Link{
-						{
-							Href: "https://compliance-framework.github.io/docs/",
-							Rel:  internal.StringAddressed("reference"),
-							Text: internal.StringAddressed("The Continuous Compliance Framework"),
-						},
+			},
+			{
+				Title: "Continuous Compliance Framework - Azure VM Plugin",
+				Type:  "tool",
+				Links: []*proto.Link{
+					{
+						Href: "https://github.com/compliance-framework/plugin-azure-vms",
+						Rel:  internal.StringAddressed("reference"),
+						Text: internal.StringAddressed("The Continuous Compliance Framework's Azure VM Plugin"),
 					},
 				},
-				{
-					Title: "Continuous Compliance Framework - Local SSH Plugin",
-					Type:  "tool",
-					Links: []*proto.Link{
-						{
-							Href: "https://github.com/compliance-framework/plugin-local-ssh",
-							Rel:  internal.StringAddressed("reference"),
-							Text: internal.StringAddressed("The Continuous Compliance Framework' Local SSH Plugin"),
-						},
+			},
+		}
+
+		components := []*proto.Component{
+			{
+				Identifier:  "common-components/azure-virtual-machine",
+				Type:        "service",
+				Title:       "Azure Virtual Machine",
+				Description: "An Azure Virtual Machine (VM) is a scalable compute resource that runs on the Azure cloud platform.",
+				Purpose:     "Virtual compute infrastructure for compute based applications",
+			},
+		}
+
+		inventory := []*proto.InventoryItem{
+			{
+				Identifier: "azure-vm/" + vm.ID(),
+				Type:       "web-server",
+				Title:      fmt.Sprintf("Azure VM [%s]", vm.ID()),
+				Props: []*proto.Property{
+					{
+						Name:  "vm-id",
+						Value: vm.ID(),
+					},
+					{
+						Name:  "vm-name",
+						Value: vm.Name(),
 					},
 				},
+			},
+		}
+
+		subjects := []*proto.Subject{
+			{
+				Type:       proto.SubjectType_SUBJECT_TYPE_COMPONENT,
+				Identifier: "common-components/azure-virtual-machine",
+			},
+			{
+				Type:       proto.SubjectType_SUBJECT_TYPE_INVENTORY_ITEM,
+				Identifier: "azure-vm/" + vm.ID(),
+			},
+		}
+
+		evidences := make([]*proto.Evidence, 0)
+		for _, policyPath := range request.GetPolicyPaths() {
+
+			processor := policyManager.NewPolicyProcessor(
+				l.logger,
+				labels,
+				subjects,
+				components,
+				inventory,
+				actors,
+				activities,
+			)
+
+			evidence, err := processor.GenerateResults(ctx, policyPath, vm)
+			evidences = append(evidences, evidence...)
+
+			if err != nil {
+				l.logger.Error("Error processing policy", "error", err, "policyPath", policyPath, "vm_id", vm.ID())
+				accumulatedErrors = errors.Join(accumulatedErrors, err)
 			}
-			components := []*proto.ComponentReference{
-				{
-					Identifier: "common-components/azure-virtual-machine",
-				},
-			}
+		}
 
-			activities := make([]*proto.Activity, 0)
-			findings := make([]*proto.Finding, 0)
-			observations := make([]*proto.Observation, 0)
-
-			for _, policyPath := range request.GetPolicyPaths() {
-				// Explicitly reset steps to make things readable
-				steps := make([]*proto.Step, 0)
-				steps = append(steps, &proto.Step{
-					Title:       "Compile policy bundle",
-					Description: "Using a locally addressable policy path, compile the policy files to an in memory executable.",
-				})
-				steps = append(steps, &proto.Step{
-					Title:       "Execute policy bundle",
-					Description: "Using previously collected JSON-formatted SSH configuration, execute the compiled policies",
-				})
-				activities = append(activities, &proto.Activity{
-					Title:       "Execute policy",
-					Description: "Prepare and compile policy bundles, and execute them using the prepared SSH configuration data",
-					Steps:       steps,
-				})
-				results, err := policyManager.New(ctx, l.logger, policyPath).Execute(ctx, "compliance_plugin", map[string]interface{}{
-					"VMID":              *vm.ID,
-					"Location":          *vm.Location,
-					"Name":              *vm.Name,
-					"Properties":        properties,
-					"Tags":              tags,
-					"Type":              *vm.Type,
-					"HardwareProfile":   vm.Properties.HardwareProfile,
-					"StorageProfile":    vm.Properties.StorageProfile,
-					"OSProfile":         vm.Properties.OSProfile,
-					"NetworkProfile":    vm.Properties.NetworkProfile,
-					"ProvisioningState": vm.Properties.ProvisioningState,
-				})
-				if err != nil {
-					l.logger.Error("policy evaluation failed", "error", err)
-					evalStatus = proto.ExecutionStatus_FAILURE
-					accumulatedErrors = errors.Join(accumulatedErrors, err)
-					continue
-				}
-
-				for _, result := range results {
-					// Observation UUID should differ for each individual subject, but remain consistent when validating the same policy for the same subject.
-					// This acts as an identifier to show the history of an observation.
-					observationUUIDMap := internal.MergeMaps(subjectAttributeMap, map[string]string{
-						"type":        "observation",
-						"policy":      result.Policy.Package.PurePackage(),
-						"policy_file": result.Policy.File,
-						"policy_path": policyPath,
-					})
-					observationUUID, err := sdk.SeededUUID(observationUUIDMap)
-					if err != nil {
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						// We've been unable to do much here, but let's try the next one regardless.
-						continue
-					}
-
-					// Finding UUID should differ for each individual subject, but remain consistent when validating the same policy for the same subject.
-					// This acts as an identifier to show the history of a finding.
-					findingUUIDMap := internal.MergeMaps(subjectAttributeMap, map[string]string{
-						"type":        "finding",
-						"policy":      result.Policy.Package.PurePackage(),
-						"policy_file": result.Policy.File,
-						"policy_path": policyPath,
-					})
-					findingUUID, err := sdk.SeededUUID(findingUUIDMap)
-					if err != nil {
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
-						// We've been unable to do much here, but let's try the next one regardless.
-						continue
-					}
-
-					observation := proto.Observation{
-						ID:         uuid.New().String(),
-						UUID:       observationUUID.String(),
-						Collected:  timestamppb.New(startTime),
-						Expires:    timestamppb.New(startTime.Add(24 * time.Hour)),
-						Origins:    []*proto.Origin{{Actors: actors}},
-						Subjects:   subjects,
-						Activities: activities,
-						Components: components,
-						RelevantEvidence: []*proto.RelevantEvidence{
-							{
-								Description: fmt.Sprintf("Policy %v was executed against the Azure Security Group configuration, using the Azure Security Group Compliance Plugin", result.Policy.Package.PurePackage()),
-							},
-						},
-					}
-
-					newFinding := func() *proto.Finding {
-						return &proto.Finding{
-							ID:        uuid.New().String(),
-							UUID:      findingUUID.String(),
-							Collected: timestamppb.New(time.Now()),
-							Labels: map[string]string{
-								"type":          "azure",
-								"service":       "virtual-machine",
-								"instance-id":   *vm.ID,
-								"instance-name": *vm.Name,
-								"_policy":       result.Policy.Package.PurePackage(),
-								"_policy_path":  result.Policy.File,
-							},
-							Origins:             []*proto.Origin{{Actors: actors}},
-							Subjects:            subjects,
-							Components:          components,
-							RelatedObservations: []*proto.RelatedObservation{{ObservationUUID: observation.ID}},
-							Controls:            nil,
-						}
-					}
-
-					// There are no violations reported from the policies.
-					// We'll send the observation back to the agent
-					if len(result.Violations) == 0 {
-
-						observation.Title = internal.StringAddressed("The plugin succeeded. No compliance issues to report.")
-						observation.Description = "The plugin policies did not return any violations. The configuration is in compliance with policies."
-						observations = append(observations, &observation)
-
-						finding := newFinding()
-						finding.Title = fmt.Sprintf("No violations found on %s", result.Policy.Package.PurePackage())
-						finding.Description = fmt.Sprintf("No violations were found on the %s policy within the Azure Security Groups Compliance Plugin.", result.Policy.Package.PurePackage())
-						finding.Status = &proto.FindingStatus{
-							State: runner.FindingTargetStatusSatisfied,
-						}
-						findings = append(findings, finding)
-						continue
-					}
-
-					// There are violations in the policy checks.
-					// We'll send these observations back to the agent
-					if len(result.Violations) > 0 {
-						observation.Title = internal.StringAddressed(fmt.Sprintf("Validation on %s failed.", result.Policy.Package.PurePackage()))
-						observation.Description = fmt.Sprintf("Observed %d violation(s) on the %s policy within the Azure Security groups Compliance Plugin.", len(result.Violations), result.Policy.Package.PurePackage())
-						observations = append(observations, &observation)
-
-						for _, violation := range result.Violations {
-							finding := newFinding()
-							finding.Title = violation.Title
-							finding.Description = violation.Description
-							finding.Remarks = internal.StringAddressed(violation.Remarks)
-							finding.Status = &proto.FindingStatus{
-								State: runner.FindingTargetStatusNotSatisfied,
-							}
-							findings = append(findings, finding)
-						}
-					}
-				}
-
-			}
-			if err = apiHelper.CreateObservations(ctx, observations); err != nil {
-				l.logger.Error("Failed to send observations", "error", err)
-				return &proto.EvalResponse{
-					Status: proto.ExecutionStatus_FAILURE,
-				}, err
-			}
-
-			if err = apiHelper.CreateFindings(ctx, findings); err != nil {
-				l.logger.Error("Failed to send findings", "error", err)
-				return &proto.EvalResponse{
-					Status: proto.ExecutionStatus_FAILURE,
-				}, err
-			}
-
+		if err = apiHelper.CreateEvidence(ctx, evidences); err != nil {
+			l.logger.Error("Failed to send evidences", "error", err)
+			evalStatus = proto.ExecutionStatus_FAILURE
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			continue
 		}
 	}
 
-	l.logger.Debug("evaluating data", vmInstances)
+	// For now, we will just return a success response.
 	return &proto.EvalResponse{
 		Status: evalStatus,
 	}, accumulatedErrors
+}
+
+func (l *CompliancePlugin) GetVMs(ctx context.Context, client *armcompute.VirtualMachinesClient) iter.Seq2[*AzureVMInstance, error] {
+
+	return func(yield func(*AzureVMInstance, error) bool) {
+		l.logger.Debug("Getting Azure Virtual Machines")
+
+		pager := client.NewListAllPager(nil)
+
+		for pager.More() {
+			page, err := pager.NextPage(ctx)
+			if err != nil {
+				l.logger.Error("unable to list VM instances", "error", err)
+				yield(nil, err)
+				return
+			}
+
+			for _, vm := range page.Value {
+				azureInstance := &AzureVMInstance{
+					Instance: vm,
+				}
+				if vm.Properties.NetworkProfile != nil {
+					config, err := l.GetNetworkConfig(ctx, vm.Properties.NetworkProfile)
+					if err != nil {
+						l.logger.Error("unable to get network interfaces", "error", err)
+						yield(nil, err)
+						return
+					}
+					azureInstance.NetworkInterfaces = config
+				}
+
+				if !yield(azureInstance, nil) {
+					return
+				}
+			}
+		}
+	}
+
+}
+
+func (l *CompliancePlugin) GetNetworkConfig(ctx context.Context, networkProfile *armcompute.NetworkProfile) ([]*AzureVMNetworkInterface, error) {
+	l.logger.Debug("Getting network configuration for Azure VM")
+	nicClient, err := armnetwork.NewInterfacesClient(l.config["subscription_id"], l.azureCredentials, nil)
+	networkInterfaces := make([]*AzureVMNetworkInterface, len(networkProfile.NetworkInterfaces))
+
+	if err != nil {
+		l.logger.Error("unable to create Azure NIC client", "error", err)
+		return nil, err
+	}
+
+	for i, nicRef := range networkProfile.NetworkInterfaces {
+		nicInterface := &AzureVMNetworkInterface{
+			PublicIPs: make([]*armnetwork.PublicIPAddressesClientGetResponse, 0),
+		}
+
+		nicParts, err := internal.ParseAzureResourceID(*nicRef.ID)
+		if err != nil {
+			l.logger.Error("unable to parse NIC ID", "error", err, "nic_id", *nicRef.ID)
+			return nil, err
+		}
+
+		resp, err := nicClient.Get(ctx, nicParts["resourceGroups"], nicParts["networkInterfaces"], nil)
+		if err != nil {
+			l.logger.Error("unable to get NIC details", "error", err, "nic_id", *nicRef.ID)
+			return nil, err
+		}
+
+		nicInterface.Config = &resp
+
+		if resp.Properties.IPConfigurations != nil {
+			for _, ipConfig := range resp.Properties.IPConfigurations {
+				if ipConfig.Properties.PublicIPAddress != nil && ipConfig.Properties.PublicIPAddress.ID != nil {
+					l.logger.Debug("Found Public IP configuration", "nic_id", *nicRef.ID, "ip_config_id", *ipConfig.ID, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+					ipParts, err := internal.ParseAzureResourceID(*ipConfig.Properties.PublicIPAddress.ID)
+					if err != nil {
+						l.logger.Error("unable to parse Public IP ID", "error", err, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+						return nil, err
+					}
+
+					publicIPClient, err := armnetwork.NewPublicIPAddressesClient(l.config["subscription_id"], l.azureCredentials, nil)
+					if err != nil {
+						l.logger.Error("unable to create Azure Public IP client", "error", err)
+						return nil, err
+					}
+
+					publicIPResp, err := publicIPClient.Get(ctx, ipParts["resourceGroups"], ipParts["publicIPAddresses"], nil)
+					if err != nil {
+						l.logger.Error("unable to get Public IP details", "error", err, "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID)
+						return nil, err
+					}
+					l.logger.Debug("Found Public IP", "public_ip_id", *ipConfig.Properties.PublicIPAddress.ID, "ip_address", *publicIPResp.Properties.IPAddress)
+					nicInterface.PublicIPs = append(nicInterface.PublicIPs, &publicIPResp)
+				}
+			}
+		}
+
+		if resp.Properties.NetworkSecurityGroup != nil && resp.Properties.NetworkSecurityGroup.ID != nil {
+			sgParts, err := internal.ParseAzureResourceID(*resp.Properties.NetworkSecurityGroup.ID)
+			if err != nil {
+				l.logger.Error("unable to parse Network Security Group ID", "error", err, "nsg_id", *resp.Properties.NetworkSecurityGroup.ID)
+				return nil, err
+			}
+
+			securityGroupClient, err := armnetwork.NewSecurityGroupsClient(l.config["subscription_id"], l.azureCredentials, nil)
+			if err != nil {
+				l.logger.Error("unable to create Azure Security Group client", "error", err)
+				return nil, err
+			}
+
+			securityGroupResp, err := securityGroupClient.Get(ctx, sgParts["resourceGroups"], sgParts["networkSecurityGroups"], nil)
+			if err != nil {
+				l.logger.Error("unable to get Network Security Group details", "error", err, "nsg_id", *resp.Properties.NetworkSecurityGroup.ID)
+				return nil, err
+			}
+			nicInterface.SecurityGroup = &securityGroupResp
+
+		}
+
+		networkInterfaces[i] = nicInterface
+	}
+	return networkInterfaces, nil
 }
 
 func main() {
